@@ -13,6 +13,7 @@ class MyApp extends StatefulWidget {
 class _MyAppState extends State<MyApp> {
   late ArCoreController arCoreController;
   bool isOriginPlaced = false; // To check if the origin has been placed
+  //
   final LocalStorage storage = new LocalStorage('ar_objects.json');
 
   @override
