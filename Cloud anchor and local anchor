@@ -1,0 +1,340 @@
+//Opening up a new session, placing a local anchor on the first tap and cloud anchors on taps after that. Uploading anchorID and distance between cloud anchor and local anchor for each anchor on firebase
+
+package com.example.myapplication;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.google.ar.core.Anchor;
+import com.google.ar.core.HitResult;
+import com.google.ar.core.Plane;
+import com.google.ar.sceneform.AnchorNode;
+import com.google.ar.sceneform.math.Vector3;
+import com.google.ar.sceneform.rendering.Color;
+import com.google.ar.sceneform.rendering.MaterialFactory;
+import com.google.ar.sceneform.rendering.Renderable;
+import com.google.ar.sceneform.rendering.ShapeFactory;
+import com.google.ar.sceneform.ux.ArFragment;
+import android.util.Log;
+import com.google.ar.sceneform.ArSceneView;
+import com.google.ar.sceneform.Scene;
+import com.google.ar.sceneform.FrameTime;
+import com.microsoft.azure.spatialanchors.CloudSpatialAnchor;
+import com.microsoft.azure.spatialanchors.CloudSpatialAnchorSession;
+import com.microsoft.azure.spatialanchors.SessionLogLevel;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import com.microsoft.azure.spatialanchors.AnchorLocateCriteria;
+import com.microsoft.azure.spatialanchors.LocateAnchorStatus;
+
+import android.view.MotionEvent;
+import android.os.Bundle;
+
+import com.google.ar.core.Anchor;
+import com.google.ar.core.Pose;
+
+import android.os.Bundle;
+import androidx.appcompat.app.AppCompatActivity;
+import com.google.firebase.FirebaseApp;
+
+import com.google.firebase.database.DatabaseReference;
+import com.google.firebase.database.FirebaseDatabase;
+
+public class MainActivity extends AppCompatActivity {
+    private boolean tapExecuted = false;
+    private final Object syncTaps = new Object();
+    private ArFragment arFragment;
+    private AnchorNode anchorNode;
+    private Renderable nodeRenderable = null;
+    private float recommendedSessionProgress = 0f;
+
+    private ArSceneView sceneView;
+    private CloudSpatialAnchorSession cloudSession;
+    private boolean sessionInitialized = false;
+    private String anchorId = null;
+    private boolean scanningForUpload = false;
+    private final Object syncSessionProgress = new Object();
+    private ExecutorService executorService = Executors.newSingleThreadExecutor();
+
+    private AnchorNode localAnchorNode;
+
+    private Anchor localAnchorOrigin;
+
+    boolean localAnchorCreated = false;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        FirebaseApp.initializeApp(this);
+
+        this.arFragment = (ArFragment) getSupportFragmentManager().findFragmentById(R.id.ux_fragment);
+        this.arFragment.setOnTapArPlaneListener(this::handleTap);
+
+        this.sceneView = arFragment.getArSceneView();
+        Scene scene = sceneView.getScene();
+        scene.addOnUpdateListener(frameTime -> {
+            if (this.cloudSession != null) {
+                this.cloudSession.processFrame(sceneView.getArFrame());
+            }
+        });
+        scene.addOnUpdateListener(this::scene_OnUpdate);
+        initializeSession();
+    }
+    protected void handleTap(HitResult hitResult, Plane plane, MotionEvent motionEvent) {
+        synchronized (this.syncTaps) {
+            // handleTap method content
+        }
+        if (!localAnchorCreated) {
+            placeLocalAnchor(hitResult, plane);
+        } else {
+            createCloudAnchor(hitResult);
+        }
+    }
+
+    private void placeLocalAnchor(HitResult hitResult, Plane plane) {
+        // Create a local anchor at the hit result position
+        Anchor localAnchor = hitResult.createAnchor();
+        localAnchorOrigin = localAnchor;
+        localAnchorCreated = true;
+
+        // Customize the appearance of the local anchor (e.g., change color)
+        MaterialFactory.makeOpaqueWithColor(this, new Color(android.graphics.Color.RED))
+                .thenAccept(material -> {
+                    Renderable localAnchorRenderable = ShapeFactory.makeSphere(0.1f, new Vector3(0.0f, 0.15f, 0.0f), material);
+
+                    // Create an AnchorNode for the local anchor
+                    AnchorNode localAnchorNode = new AnchorNode(localAnchor);
+                    localAnchorNode.setRenderable(localAnchorRenderable);
+
+                    // Add the local anchor node to the AR scene
+                    arFragment.getArSceneView().getScene().addChild(localAnchorNode);
+                });
+    }
+
+    private void createCloudAnchor(HitResult hitResult) {
+        synchronized (this.syncTaps) {
+            if (this.tapExecuted) {
+                return;
+            }
+
+            this.tapExecuted = true;
+        }
+
+        if (this.anchorId != null) {
+            this.anchorNode.getAnchor().detach();
+            this.anchorNode.setParent(null);
+            this.anchorNode = null;
+            initializeSession();
+            AnchorLocateCriteria criteria = new AnchorLocateCriteria();
+            criteria.setIdentifiers(new String[]{this.anchorId});
+            cloudSession.createWatcher(criteria);
+            return;
+        }
+
+        Anchor localAnchor = hitResult.createAnchor();
+
+        MaterialFactory.makeOpaqueWithColor(this, new Color(this.recommendedSessionProgress, this.recommendedSessionProgress, this.recommendedSessionProgress))
+                .thenAccept(material -> {
+                    this.nodeRenderable = ShapeFactory.makeSphere(0.1f, new Vector3(0.0f, 0.15f, 0.0f), material);
+                    this.anchorNode = new AnchorNode();
+                    this.anchorNode.setAnchor(localAnchor);
+                    this.anchorNode.setRenderable(nodeRenderable);
+                    this.anchorNode.setParent(arFragment.getArSceneView().getScene());
+                });
+
+        CloudSpatialAnchor cloudAnchor = new CloudSpatialAnchor();
+        cloudAnchor.setLocalAnchor(localAnchor);
+
+        uploadCloudAnchorAsync(cloudAnchor)
+                .thenAccept(id -> {
+                    this.anchorId = id;
+                    Log.i("ASAInfo", String.format("Cloud Anchor created: %s", this.anchorId));
+                    runOnUiThread(() -> {
+                        MaterialFactory.makeOpaqueWithColor(this, new Color(android.graphics.Color.BLUE))
+                                .thenAccept(blueMaterial -> {
+                                    this.nodeRenderable.setMaterial(blueMaterial);
+                                    synchronized (this.syncTaps) {
+                                        this.tapExecuted = false;
+                                    }
+                                });
+                    });
+
+                    // Save the cloud anchor ID and its distance with the local anchor in the database
+                    saveAnchorToDatabase(this.anchorId, calculateDistance(localAnchorOrigin, this.anchorNode.getAnchor()));
+                });
+    }
+
+    private void saveAnchorToDatabase(String cloudAnchorId, float distance) {
+        // Get reference to the Firebase database
+        DatabaseReference databaseReference = FirebaseDatabase.getInstance().getReference();
+
+        // Create a new child node in the "anchors" node with a unique key
+        DatabaseReference anchorReference = databaseReference.child("anchors").push();
+
+        // Create a data object to save to the database
+        AnchorData anchorData = new AnchorData(cloudAnchorId, distance);
+
+        // Set the value of the child node to the AnchorData object
+        anchorReference.setValue(anchorData);
+
+        // Log success message
+        Log.i("DatabaseInfo", "Anchor saved to Firebase database");
+    }
+
+    public class AnchorData {
+        private String cloudAnchorId;
+        private float distance;
+
+        public AnchorData() {
+            // Default constructor required for calls to DataSnapshot.getValue(AnchorData.class)
+        }
+
+        public AnchorData(String cloudAnchorId, float distance) {
+            this.cloudAnchorId = cloudAnchorId;
+            this.distance = distance;
+        }
+
+        public String getCloudAnchorId() {
+            return cloudAnchorId;
+        }
+
+        public void setCloudAnchorId(String cloudAnchorId) {
+            this.cloudAnchorId = cloudAnchorId;
+        }
+
+        public float getDistance() {
+            return distance;
+        }
+
+        public void setDistance(float distance) {
+            this.distance = distance;
+        }
+    }
+
+
+    private float calculateDistance(Anchor localAnchor, Anchor cloudAnchor) {
+        // Get the world space position of both anchors
+        Pose localPose = localAnchor.getPose();
+        Pose cloudPose = cloudAnchor.getPose();
+
+        // Get the translation vectors of both anchors
+        float[] localTranslation = new float[3];
+        float[] cloudTranslation = new float[3];
+        localPose.getTranslation(localTranslation, 0);
+        cloudPose.getTranslation(cloudTranslation, 0);
+
+        // Calculate the distance between the two anchor positions using Euclidean distance formula
+        float dx = localTranslation[0] - cloudTranslation[0];
+        float dy = localTranslation[1] - cloudTranslation[1];
+        float dz = localTranslation[2] - cloudTranslation[2];
+        return (float) Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private void initializeSession() {
+        if (sceneView.getSession() == null) {
+            //Early return if the ARCore Session is still being set up
+            return;
+        }
+
+        if (this.cloudSession != null) {
+            this.cloudSession.close();
+        }
+        this.cloudSession = new CloudSpatialAnchorSession();
+        this.cloudSession.setSession(sceneView.getSession());
+        this.cloudSession.setLogLevel(SessionLogLevel.Information);
+        this.cloudSession.addOnLogDebugListener(args -> Log.d("ASAInfo", args.getMessage()));
+        this.cloudSession.addErrorListener(args -> Log.e("ASAError", String.format("%s: %s", args.getErrorCode().name(), args.getErrorMessage())));
+
+        sessionInitialized = true;
+
+        this.cloudSession.addSessionUpdatedListener(args -> {
+            synchronized (this.syncSessionProgress) {
+                this.recommendedSessionProgress = args.getStatus().getRecommendedForCreateProgress();
+                Log.i("ASAInfo", String.format("Session progress: %f", this.recommendedSessionProgress));
+                if (!this.scanningForUpload) {
+                    return;
+                }
+            }
+
+            runOnUiThread(() -> {
+                synchronized (this.syncSessionProgress) {
+                    MaterialFactory.makeOpaqueWithColor(this, new Color(
+                                    this.recommendedSessionProgress,
+                                    this.recommendedSessionProgress,
+                                    this.recommendedSessionProgress))
+                            .thenAccept(material -> {
+                                this.nodeRenderable.setMaterial(material);
+                            });
+                }
+            });
+        });
+        this.cloudSession.addAnchorLocatedListener(args -> {
+            if (args.getStatus() == LocateAnchorStatus.Located) {
+                runOnUiThread(() -> {
+                    this.anchorNode = new AnchorNode();
+                    this.anchorNode.setAnchor(args.getAnchor().getLocalAnchor());
+                    MaterialFactory.makeOpaqueWithColor(this, new Color(android.graphics.Color.GREEN))
+                            .thenAccept(greenMaterial -> {
+                                this.nodeRenderable = ShapeFactory.makeSphere(0.1f, new Vector3(0.0f, 0.15f, 0.0f), greenMaterial);
+                                this.anchorNode.setRenderable(nodeRenderable);
+                                this.anchorNode.setParent(arFragment.getArSceneView().getScene());
+
+                                this.anchorId = null;
+                                synchronized (this.syncTaps) {
+                                    this.tapExecuted = false;
+                                }
+                            });
+                });
+            }
+        });
+        this.cloudSession.getConfiguration().setAccountId("6df5c2c8-b1a8-49eb-8611-8644c64b7540");
+        this.cloudSession.getConfiguration().setAccountKey("HhGUM+1mSlVMQLEPuQaxLy3eD0VS4ufIJFuL9nsTENk=");
+        this.cloudSession.getConfiguration().setAccountDomain("southeastasia.mixedreality.azure.com");
+        this.cloudSession.start();
+    }
+    private void scene_OnUpdate(FrameTime frameTime) {
+        if (!sessionInitialized) {
+            //retry if initializeSession did an early return due to ARCore Session not yet available (i.e. sceneView.getSession() == null)
+            initializeSession();
+        }
+    }
+    private CompletableFuture<String> uploadCloudAnchorAsync(CloudSpatialAnchor anchor) {
+        synchronized (this.syncSessionProgress) {
+            this.scanningForUpload = true;
+        }
+
+
+        return CompletableFuture.runAsync(() -> {
+            try {
+                float currentSessionProgress;
+                do {
+                    synchronized (this.syncSessionProgress) {
+                        currentSessionProgress = this.recommendedSessionProgress;
+                    }
+                    if (currentSessionProgress < 1.0) {
+                        Thread.sleep(500);
+                    }
+                }
+                while (currentSessionProgress < 1.0);
+
+                synchronized (this.syncSessionProgress) {
+                    this.scanningForUpload = false;
+                }
+                runOnUiThread(() -> {
+                    MaterialFactory.makeOpaqueWithColor(this, new Color(android.graphics.Color.YELLOW))
+                            .thenAccept(yellowMaterial -> {
+                                this.nodeRenderable.setMaterial(yellowMaterial);
+                            });
+                });
+
+                this.cloudSession.createAnchorAsync(anchor).get();
+            } catch (InterruptedException | ExecutionException e) {
+                Log.e("ASAError", e.toString());
+                throw new RuntimeException(e);
+            }
+        }, executorService).thenApply(ignore -> anchor.getIdentifier());
+    }
+}
